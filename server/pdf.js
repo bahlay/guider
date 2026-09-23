@@ -133,6 +133,28 @@ export function addPdfHeader(doc, title = "") {
   doc.y = 100;
 }
 
+// Color per flag type, matching the four categories used throughout the
+// pipeline (see claude.js's prompt schema). Kept simple/legible for
+// print rather than trying to match on-screen UI styling exactly.
+const FLAG_STYLES = {
+  corrected_mistake: {
+    label: "Corrected mistake",
+    color: "#96690F"
+  },
+  missing_step: {
+    label: "Possible missing step",
+    color: "#B4442E"
+  },
+  low_confidence: {
+    label: "Low confidence",
+    color: "#7A5FB8"
+  },
+  unverified_outcome: {
+    label: "Unverified outcome",
+    color: "#B4442E"
+  }
+};
+
 export function addPdfStep(
   doc,
   step,
@@ -153,6 +175,16 @@ export function addPdfStep(
   const instruction =
     step.instruction || "";
 
+  const flagStyle = step.flag
+    ? FLAG_STYLES[step.flag]
+    : null;
+
+  const flagText = flagStyle
+    ? `${flagStyle.label}${
+        step.flagNote ? " — " + step.flagNote : ""
+      }`
+    : "";
+
   const imageMaxHeight =
     doc.page.height -
     margin * 2 -
@@ -169,6 +201,13 @@ export function addPdfStep(
       lineGap: 3
     });
 
+  const flagHeight = flagText
+    ? doc.heightOfString(flagText, {
+        width: contentWidth,
+        lineGap: 2
+      }) + 8
+    : 0;
+
   const estimatedImageHeight =
     imagePath
       ? Math.min(
@@ -181,6 +220,7 @@ export function addPdfStep(
     titleHeight +
     8 +
     instructionHeight +
+    flagHeight +
     (imagePath
       ? 14 + estimatedImageHeight
       : 0) +
@@ -218,6 +258,19 @@ export function addPdfStep(
       lineGap: 3
     });
 
+  if (flagText) {
+    doc.moveDown(0.3);
+
+    doc
+      .font("Helvetica-Bold")
+      .fontSize(9)
+      .fillColor(flagStyle.color)
+      .text(flagText, {
+        width: contentWidth,
+        lineGap: 2
+      });
+  }
+
   if (imagePath) {
     doc.moveDown(0.55);
 
@@ -244,4 +297,55 @@ export function addPdfStep(
   } else {
     doc.moveDown(0.8);
   }
+}
+
+// Renders the guide-level "notes" (FYI, no action needed -- e.g. a
+// toggle that was switched on then back off with no net effect) and
+// "warnings" (genuinely uncertain, needs human review) sections at the
+// end of the PDF. Without this, that information exists in the JSON
+// response but never reaches the actual exported document, which is the
+// deliverable most likely to be read on its own.
+export function addPdfAsides(doc, notes = [], warnings = []) {
+  const margin = 42;
+  const contentWidth = doc.page.width - margin * 2;
+
+  function renderList(heading, items, color) {
+    if (!items || !items.length) return;
+
+    const availableHeight =
+      doc.page.height - margin - doc.y;
+
+    if (availableHeight < 80) {
+      doc.addPage();
+      addPdfHeader(doc);
+    }
+
+    doc.moveDown(0.6);
+
+    doc
+      .font("Helvetica-Bold")
+      .fontSize(12)
+      .fillColor(color)
+      .text(heading, {
+        width: contentWidth
+      });
+
+    doc.moveDown(0.3);
+
+    items.forEach((item) => {
+      doc
+        .font("Helvetica")
+        .fontSize(9.5)
+        .fillColor("#333333")
+        .text(`•  ${item}`, {
+          width: contentWidth,
+          lineGap: 2
+        });
+
+      doc.moveDown(0.2);
+    });
+  }
+
+  renderList("Additional notes", notes, "#3B4A63");
+  renderList("Needs human review", warnings, "#B4442E");
 }
