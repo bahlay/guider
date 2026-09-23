@@ -106,7 +106,7 @@ function App() {
         setProgress((current) => {
           if (current >= 90) return current;
 
-          return current + 0.8;
+          return Math.min(90, current + 1);
         });
       }, 900);
 
