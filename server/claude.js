@@ -5,36 +5,8 @@ const client = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
-// Pass 1 (buildGuide) does the hard judgment work: reconstructing a
-// whole multi-step workflow from many images at once. Keep this on the
-// stronger model.
 const MODEL =
   process.env.ANTHROPIC_MODEL || "claude-sonnet-5";
-
-// Pass 2 (refineStepEvidence) only picks the single best frame among a
-// handful of close-together candidates for ONE step at a time -- a much
-// narrower task than pass 1's full-workflow reconstruction. It's called
-// once per step (several times per video), so using a cheaper/faster
-// model here is a safe, meaningful cost cut rather than a quality risk.
-const REFINE_MODEL =
-  process.env.ANTHROPIC_REFINE_MODEL ||
-  "claude-haiku-4-5-20251001";
-
-// Approximate published per-million-token rates (USD), used only to
-// estimate cost for the metrics report. ALWAYS re-check against
-// Anthropic's live pricing page (https://platform.claude.com/docs/en/about-claude/pricing)
-// before quoting these as final -- rates change and are not fetched
-// dynamically here. Current as of the date this file was last edited.
-const MODEL_RATES_USD_PER_MTOK = {
-  "claude-sonnet-5": { input: 3.0, output: 15.0 },
-  "claude-haiku-4-5-20251001": { input: 1.0, output: 5.0 }
-};
-
-// Frames actually sent to the API are capped here regardless of how
-// densely video.js sampled the source on disk. This bounds token cost
-// per video and keeps pass 1's single big call from growing unbounded
-// on longer recordings.
-const MAX_FRAMES_TO_ANALYZE = 50;
 
 function parseJson(text) {
   const cleaned = String(text)
@@ -46,44 +18,15 @@ function parseJson(text) {
   try {
     return JSON.parse(cleaned);
   } catch {
-    // Fallback: the model may have written analysis/reasoning BEFORE the
-    // JSON despite being told not to (this happens more than you'd
-    // expect on complex prompts). Try every "{" in the string in turn,
-    // walking forward from each to find ITS matching "}" via brace
-    // depth-tracking, and attempt to parse that slice. We don't stop at
-    // the first "{" found -- if the preamble itself contains a stray
-    // brace (e.g. the model quoting an inline example while explaining
-    // itself), that first slice may fail to parse, and naively giving up
-    // there would miss the real JSON object later in the text.
-    let searchFrom = 0;
+    const start = cleaned.indexOf("{");
+    const end = cleaned.lastIndexOf("}");
 
-    while (true) {
-      const start = cleaned.indexOf("{", searchFrom);
-      if (start === -1) break;
-
-      let depth = 0;
-      let end = -1;
-
-      for (let i = start; i < cleaned.length; i++) {
-        if (cleaned[i] === "{") depth++;
-
-        if (cleaned[i] === "}") {
-          depth--;
-
-          if (depth === 0) {
-            end = i;
-            break;
-          }
-        }
-      }
-
-      if (end === -1) break; // unterminated from here on, nothing more to try
-
+    if (start >= 0 && end > start) {
       try {
-        return JSON.parse(cleaned.slice(start, end + 1));
-      } catch {
-        searchFrom = start + 1; // this candidate wasn't it -- try the next "{"
-      }
+        return JSON.parse(
+          cleaned.slice(start, end + 1)
+        );
+      } catch {}
     }
 
     console.error(
@@ -99,54 +42,13 @@ function parseJson(text) {
 
 function makeFrameObjects(
   files,
-  interval,
-  finalFrameTimestamp
+  interval
 ) {
-  const lastIndex = files.length - 1;
-
   return files.map((file, index) => ({
     file,
     index,
-    // The final frame (see video.js) isn't part of the regular
-    // fps=1/interval sequence, so index * interval would mislabel it --
-    // use its real reported timestamp instead.
-    timestamp:
-      index === lastIndex &&
-      typeof finalFrameTimestamp === "number"
-        ? finalFrameTimestamp
-        : index * interval,
+    timestamp: index * interval,
   }));
-}
-
-// Evenly samples down to `maxCount` frames across the WHOLE recording,
-// rather than just taking the first N (which would bias coverage toward
-// the start of the video and could miss everything after it). Always
-// keeps the first and last frame -- the last frame in particular is
-// usually the strongest evidence of whether the operation actually
-// succeeded, so it must never be dropped by sampling.
-function sampleFrames(frames, maxCount) {
-  if (frames.length <= maxCount) {
-    return frames;
-  }
-
-  const lastIndex = frames.length - 1;
-  const step = lastIndex / (maxCount - 1);
-  const result = [];
-  const seen = new Set();
-
-  for (let i = 0; i < maxCount; i++) {
-    const idx = Math.min(
-      Math.round(i * step),
-      lastIndex
-    );
-
-    if (!seen.has(idx)) {
-      seen.add(idx);
-      result.push(frames[idx]);
-    }
-  }
-
-  return result;
 }
 
 function nearestFrame(
@@ -208,61 +110,13 @@ function getNearbyFrames(
     : [];
 }
 
-// Tracks token usage and timing for every Claude call in a single video's
-// analysis, so the app can report a REAL measured cost/time per video
-// rather than an estimate written after the fact.
-function createUsageTracker() {
-  const calls = [];
-
-  return {
-    record(stage, model, inputTokens, outputTokens, ms) {
-      calls.push({
-        stage,
-        model,
-        inputTokens,
-        outputTokens,
-        ms
-      });
-    },
-    summary() {
-      let estimatedCostUsd = 0;
-      let totalApiMs = 0;
-
-      for (const call of calls) {
-        const rate =
-          MODEL_RATES_USD_PER_MTOK[call.model] || {
-            input: 0,
-            output: 0
-          };
-
-        estimatedCostUsd +=
-          (call.inputTokens / 1_000_000) * rate.input +
-          (call.outputTokens / 1_000_000) * rate.output;
-
-        totalApiMs += call.ms;
-      }
-
-      return {
-        calls,
-        totalApiCalls: calls.length,
-        estimatedCostUsd: Number(
-          estimatedCostUsd.toFixed(6)
-        ),
-        totalApiMs
-      };
-    }
-  };
-}
-
 async function callClaude(
   content,
-  { model = MODEL, maxTokens = 12000, stage, usage } = {}
+  maxTokens = 12000
 ) {
-  const started = Date.now();
-
   const response =
     await client.messages.create({
-      model,
+      model: MODEL,
       max_tokens: maxTokens,
       messages: [
         {
@@ -271,18 +125,6 @@ async function callClaude(
         },
       ],
     });
-
-  const ms = Date.now() - started;
-
-  if (usage) {
-    usage.record(
-      stage || "unknown",
-      model,
-      response.usage?.input_tokens || 0,
-      response.usage?.output_tokens || 0,
-      ms
-    );
-  }
 
   return response.content
     .filter(
@@ -298,13 +140,9 @@ async function callClaude(
 async function buildGuide(
   frames,
   duration,
-  originalname,
-  usage
+  originalname
 ) {
-  const selectedFrames = sampleFrames(
-    frames,
-    MAX_FRAMES_TO_ANALYZE
-  );
+  const selectedFrames = frames;
 
   const content = [
     {
@@ -350,21 +188,17 @@ Examples:
 - "Save the table" → use a frame showing the cursor on the Save button during/just before the click.
 - Final verification → use the resulting successful state.
 
-CORRECTIONS AND TRANSPARENCY:
+CORRECTIONS:
 
-If a value is changed multiple times, use the final value that is actually committed in the successful state. Do not recommend abandoned values, and do not give an abandoned action its own numbered step.
+If a value is changed multiple times, use the final value that is actually committed in the successful state.
 
-But do NOT silently erase evidence of a correction -- transparency about what was corrected is required, not optional:
-
-- If a whole action was tried and fully reversed with NO net effect on the final result (e.g. a toggle switched on then back off, ending exactly where it started), add ONE entry to "notes" describing this plainly (e.g. "The Public toggle was switched on and off; this had no effect on the final result and was left out of the steps."). Do not create a step for it.
-- If a segment mixes an abandoned sub-action with a kept one (e.g. "typed the name AND toggled a setting that was later reverted"), still create the step for the KEPT part, and separately note the abandoned part in "notes".
-- If a value was corrected to something DIFFERENT from its starting/default state (not just reverted to where it started), it still needs its own step describing the FINAL value, with "flag": "corrected_mistake" and a "flagNote" explaining what was tried and changed.
+Do not recommend abandoned values.
 
 DEFAULTS:
 
-If a setting starts at some default and the recording leaves it unchanged, do not make it a step. If EVERY optional setting on a form ends up unchanged from default, add one short clause to the step nearest the final commit action (e.g. "...then, leaving the optional settings unchanged, click Save") rather than omitting any mention of them at all.
+If a setting starts enabled by default and the recording leaves it unchanged, do not make it a step.
 
-If the user explicitly changes a setting, include it as its own step.
+If the user explicitly changes a setting, include it.
 
 DROPDOWNS:
 
@@ -376,7 +210,7 @@ For a dropdown/select action, the preferred timestamp MUST correspond to a frame
 
 Do not use a later closed dropdown merely because the selected value is visible.
 
-If no frame clearly captures the dropdown interaction, use the clearest available frame showing the final selected value, set "flag": "low_confidence", and say so plainly in "flagNote".
+If no frame clearly captures the dropdown interaction, use the clearest available frame showing the final selected value and explicitly state that the exact dropdown interaction was not clearly captured.
 
 SCREENSHOTS:
 
@@ -388,7 +222,6 @@ For text entry:
 
 - prefer a frame where the cursor is directly inside or clearly over the relevant input field;
 - the intended value should also be visible if possible.
-- If NO frame clearly shows the value being entered, but a LATER frame confirms the true final value (e.g. the created item's own listed properties), you may reference that later frame as evidence instead -- state the confirmed value plainly in the instruction, set "flag": "low_confidence", and explain in "flagNote" that the exact typing moment wasn't clearly captured even though the final value is confirmed elsewhere.
 
 For checkbox/toggle:
 
@@ -403,19 +236,15 @@ For Create New Table:
 - prefer the original screen with the cursor on Create new table;
 - NEVER use the already-open modal as evidence for the click that opened the modal.
 
-The action that COMMITS the operation (e.g. clicking "Save"/"Create") and the step that shows the CONFIRMATION of success (e.g. a toast, the new item appearing in a list) are always TWO SEPARATE STEPS, even if one segment of the recording captures both. Never write one instruction that describes both the click and its result together. If the recording doesn't clearly show a success confirmation, set "flag": "unverified_outcome" on the last step and say so honestly in "flagNote" rather than claiming a success the footage doesn't show.
-
-If the recording jumps over a step that seems necessary but isn't shown (a state changed with no visible cause), add a step (or, if nothing can usefully be instructed, a "notes" entry) with "flag": "missing_step" explaining what's missing. Do not invent a plausible action to fill the gap.
-
 IMPORTANT:
 
-Do not choose a later result frame merely because the final value is clearer, UNLESS you are explicitly using the "later frame as evidence for an unclear value" allowance above, and you disclose it via "flag": "low_confidence".
+Do not choose a later result frame merely because the final value is clearer.
 
 The selected frame must represent the action described by the instruction.
 
-Return ONLY valid JSON. Do not write any analysis, reasoning, or commentary before the JSON -- your reply must start with "{" as its very first character. Do all your reasoning internally, then output only the final JSON object.
+Return ONLY valid JSON.
 
-Use exactly this shape:
+Use exactly:
 
 {
   "title": "How to ...",
@@ -426,20 +255,11 @@ Use exactly this shape:
       "instruction": "Click ...",
       "timestamp": 12.5,
       "frame": 25,
-      "evidence": "The Create new table control is visible with the cursor on it.",
-      "flag": null,
-      "flagNote": null
+      "evidence": "The Create new table control is visible with the cursor on it."
     }
   ],
-  "notes": [
-    "FYI context needing no user action, e.g. a toggle switched on then back off with no net effect."
-  ],
-  "warnings": [
-    "Anything genuinely uncertain that needs human review."
-  ]
+  "warnings": []
 }
-
-"flag" must be exactly one of: null, "corrected_mistake", "missing_step", "low_confidence", "unverified_outcome".
 
 Do not include markdown.
 `,
@@ -466,52 +286,15 @@ Do not include markdown.
     });
   }
 
-  const raw = await callClaude(content, {
-    model: MODEL,
-    maxTokens: 12000,
-    stage: "build_guide",
-    usage
-  });
+  const raw =
+    await callClaude(content);
 
-  const parsed = parseJson(raw);
-
-  // Defensive validation: a syntactically-valid JSON object doesn't
-  // guarantee the right shape. Drop any step missing the fields the rest
-  // of the pipeline depends on, rather than letting a malformed step
-  // silently propagate through frame lookups and the PDF export.
-  const steps = Array.isArray(parsed.steps)
-    ? parsed.steps.filter((step) => {
-        const valid =
-          step &&
-          typeof step.instruction === "string" &&
-          step.instruction.trim().length > 0 &&
-          Number.isFinite(Number(step.timestamp));
-
-        if (!valid) {
-          console.error(
-            "Dropping malformed step from model output:",
-            step
-          );
-        }
-
-        return valid;
-      })
-    : [];
-
-  return {
-    ...parsed,
-    steps,
-    notes: Array.isArray(parsed.notes) ? parsed.notes : [],
-    warnings: Array.isArray(parsed.warnings)
-      ? parsed.warnings
-      : []
-  };
+  return parseJson(raw);
 }
 
 async function refineStepEvidence(
   step,
-  frames,
-  usage
+  frames
 ) {
   const candidates =
     getNearbyFrames(
@@ -599,12 +382,7 @@ No markdown.
     const raw =
       await callClaude(
         content,
-        {
-          model: REFINE_MODEL,
-          maxTokens: 3000,
-          stage: "refine_evidence",
-          usage
-        }
+        3000
       );
 
     const selected =
@@ -677,8 +455,7 @@ export async function analyzeWithClaude(
   frames,
   interval,
   duration,
-  originalname,
-  finalFrameTimestamp
+  originalname
 ) {
   if (
     !frames ||
@@ -689,23 +466,18 @@ export async function analyzeWithClaude(
     );
   }
 
-  const usage = createUsageTracker();
-
   const frameObjects =
     makeFrameObjects(
       frames,
-      Number(interval),
-      finalFrameTimestamp
+      Number(interval)
     );
-
-  const framesToSend = Math.min(
-    frameObjects.length,
-    MAX_FRAMES_TO_ANALYZE
-  );
 
   console.log(
     `Frames extracted: ${frameObjects.length} ` +
-      `Frames sent: ${framesToSend}`
+      `Frames sent: ${Math.min(
+        frameObjects.length,
+        50
+      )}`
   );
 
   // PASS 1:
@@ -715,8 +487,7 @@ export async function analyzeWithClaude(
     await buildGuide(
       frameObjects,
       duration,
-      originalname,
-      usage
+      originalname
     );
 
   if (
@@ -742,8 +513,7 @@ export async function analyzeWithClaude(
     const refined =
       await refineStepEvidence(
         step,
-        frameObjects,
-        usage
+        frameObjects
       );
 
     refinedSteps.push(
@@ -755,7 +525,5 @@ export async function analyzeWithClaude(
     ...guide,
     steps:
       refinedSteps,
-    usage: usage.summary(),
-    framesAnalyzed: framesToSend
   };
 }

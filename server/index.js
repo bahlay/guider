@@ -19,8 +19,7 @@ import {
 import {
   safeName,
   addPdfHeader,
-  addPdfStep,
-  addPdfAsides
+  addPdfStep
 } from "./pdf.js";
 
 const app = express();
@@ -98,27 +97,20 @@ app.post(
 
       const {
         files: frames,
-        interval,
-        finalFrameTimestamp
+        interval
       } = await extractFrames(
         input,
         frameDir,
         duration
       );
 
-      const framesStarted = Date.now();
-
       const guide =
         await analyzeWithClaude(
           frames,
           interval,
           duration,
-          req.file.originalname,
-          finalFrameTimestamp
+          req.file.originalname
         );
-
-      const analysisMs =
-        Date.now() - framesStarted;
 
       const frameBase =
         path.basename(frameDir);
@@ -152,40 +144,19 @@ app.post(
           }
         );
 
-      // These numbers come straight from what actually happened this
-      // run (real token counts from the API responses, real wall-clock
-      // time), not an estimate written separately -- see claude.js's
-      // usage tracker. MODEL_RATES_USD_PER_MTOK in claude.js is a
-      // hardcoded snapshot of published pricing; verify against
-      // Anthropic's live pricing page before quoting these numbers
-      // anywhere final, and note that hosting/infra cost is separate
-      // from this per-operation API cost estimate.
       guide.metrics = {
         totalSeconds:
           (Date.now() - started) /
           1000,
-        analysisSeconds: analysisMs / 1000,
         videoDurationSeconds:
           duration,
-        framesExtracted: frames.length,
         framesAnalyzed:
-          guide.framesAnalyzed ??
           Math.min(frames.length, 50),
         frameIntervalSeconds:
           interval,
-        buildModel:
+        model:
           process.env.ANTHROPIC_MODEL ||
-          "claude-sonnet-5",
-        refineModel:
-          process.env.ANTHROPIC_REFINE_MODEL ||
-          "claude-haiku-4-5-20251001",
-        estimatedCostUsd:
-          guide.usage?.estimatedCostUsd ?? null,
-        totalApiCalls:
-          guide.usage?.totalApiCalls ?? null,
-        totalApiSeconds: guide.usage
-          ? guide.usage.totalApiMs / 1000
-          : null
+          "claude-sonnet-5"
       };
 
       res.json(guide);
@@ -211,9 +182,7 @@ app.post(
     try {
       const {
         title,
-        steps,
-        notes,
-        warnings
+        steps
       } = req.body || {};
 
       if (
@@ -261,12 +230,6 @@ app.post(
             OUTPUTS
           );
         }
-      );
-
-      addPdfAsides(
-        doc,
-        Array.isArray(notes) ? notes : [],
-        Array.isArray(warnings) ? warnings : []
       );
 
       doc.end();
