@@ -11,14 +11,18 @@ const client = new Anthropic({
 const MODEL =
   process.env.ANTHROPIC_MODEL || "claude-sonnet-5";
 
-// Pass 2 (refineStepEvidence) only picks the single best frame among a
-// handful of close-together candidates for ONE step at a time -- a much
-// narrower task than pass 1's full-workflow reconstruction. It's called
-// once per step (several times per video), so using a cheaper/faster
-// model here is a safe, meaningful cost cut rather than a quality risk.
+// Pass 2 (refineStepEvidence) picks the single best frame among a
+// handful of close-together candidates for ONE step at a time. This
+// still requires precise visual judgment -- telling an open dropdown
+// from closed, or a cursor exactly on a checkbox vs. merely near it --
+// so it defaults to the SAME model as pass 1 rather than a cheaper one.
+// A prior attempt to move this to a cheaper model measurably hurt
+// screenshot precision; that assumption ("narrow task = easy task") was
+// wrong for fine-grained visual grounding specifically. Override via env
+// var only after you've confirmed quality holds up with your own tests.
 const REFINE_MODEL =
   process.env.ANTHROPIC_REFINE_MODEL ||
-  "claude-haiku-4-5-20251001";
+  MODEL;
 
 // Approximate published per-million-token rates (USD), used only to
 // estimate cost for the metrics report. ALWAYS re-check against
@@ -30,11 +34,20 @@ const MODEL_RATES_USD_PER_MTOK = {
   "claude-haiku-4-5-20251001": { input: 1.0, output: 5.0 }
 };
 
-// Frames actually sent to the API are capped here regardless of how
-// densely video.js sampled the source on disk. This bounds token cost
-// per video and keeps pass 1's single big call from growing unbounded
-// on longer recordings.
-const MAX_FRAMES_TO_ANALYZE = 50;
+// Frames actually sent to Pass 1 are capped here as a safety ceiling,
+// not a routine constraint -- this was set too aggressively (50) in a
+// prior revision while trying to fix a cost-related log inaccuracy, and
+// that cut measurably hurt precision by showing pass 1 roughly a third
+// of the frames it used to see for a typical test video. 150 keeps
+// effectively all frames for any recording under the app's 2-minute
+// limit (a 120s video at the densest interval tier produces ~200 raw
+// frames, so this still trims extreme cases without binding on normal
+// ones). Tune down via ANTHROPIC_MAX_FRAMES once you've checked real
+// measured cost (see guide.metrics / guide.usage) against your budget --
+// don't guess at this number without looking at the actual cost first.
+const MAX_FRAMES_TO_ANALYZE = Number(
+  process.env.ANTHROPIC_MAX_FRAMES
+) || 150;
 
 function parseJson(text) {
   const cleaned = String(text)
