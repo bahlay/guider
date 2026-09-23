@@ -142,8 +142,7 @@ async function buildGuide(
   duration,
   originalname
 ) {
-  const selectedFrames =
-    frames.slice(0, 50);
+  const selectedFrames = frames;
 
   const content = [
     {
