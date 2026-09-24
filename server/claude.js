@@ -126,6 +126,28 @@ async function callClaude(
       ],
     });
 
+  const inputTokens =
+    response.usage?.input_tokens || 0;
+
+  const outputTokens =
+    response.usage?.output_tokens || 0;
+
+  const inputCost =
+    (inputTokens / 1_000_000) * 2;
+
+  const outputCost =
+    (outputTokens / 1_000_000) * 10;
+
+  const totalCost =
+    inputCost + outputCost;
+
+  console.log(
+    `Claude API: ` +
+      `input=${inputTokens} ` +
+      `output=${outputTokens} ` +
+      `cost=$${totalCost.toFixed(4)}`
+  );
+
   return response.content
     .filter(
       (item) =>
@@ -474,10 +496,7 @@ export async function analyzeWithClaude(
 
   console.log(
     `Frames extracted: ${frameObjects.length} ` +
-      `Frames sent: ${Math.min(
-        frameObjects.length,
-        50
-      )}`
+      `Frames sent: ${frameObjects.length}`
   );
 
   // PASS 1:
